@@ -3397,6 +3397,9 @@ static void ath12k_mac_init_arvif(struct ath12k_vif *ahvif,
 	arvif->ahvif = ahvif;
 	arvif->link_id = _link_id;
 
+	/* Protects the datapath stats update on a per link basis */
+	spin_lock_init(&arvif->link_stats_lock);
+
 	INIT_LIST_HEAD(&arvif->list);
 	INIT_DELAYED_WORK(&arvif->connection_loss_work,
 			  ath12k_mac_vif_sta_connection_loss_work);
@@ -4665,7 +4668,6 @@ static int ath12k_install_key(struct ath12k_link_vif *arvif,
 		.macaddr = macaddr,
 	};
 	struct ath12k_vif *ahvif = arvif->ahvif;
-	struct ieee80211_vif *vif = ath12k_ahvif_to_vif(ahvif);
 
 	lockdep_assert_wiphy(ath12k_ar_to_hw(ar)->wiphy);
 
@@ -4718,7 +4720,7 @@ install:
 	if (!wait_for_completion_timeout(&ar->install_key_done, 1 * HZ))
 		return -ETIMEDOUT;
 
-	if (ether_addr_equal(macaddr, vif->addr))
+	if (ether_addr_equal(macaddr, arvif->bssid))
 		ahvif->key_cipher = key->cipher;
 
 	return ar->install_key_status ? -EINVAL : 0;
@@ -7467,7 +7469,7 @@ static void ath12k_mac_op_tx(struct ieee80211_hw *hw,
 
 	if (!vif->valid_links || !is_mcast ||
 	    test_bit(ATH12K_FLAG_RAW_MODE, &ar->ab->dev_flags)) {
-		ret = ath12k_dp_tx(ar, arvif, skb, false, 0);
+		ret = ath12k_dp_tx(ar, arvif, skb, false, 0, is_mcast);
 		if (unlikely(ret)) {
 			ath12k_warn(ar->ab, "failed to transmit frame %d\n", ret);
 			ieee80211_free_txskb(ar->ah->hw, skb);
@@ -7500,7 +7502,7 @@ static void ath12k_mac_op_tx(struct ieee80211_hw *hw,
 			skb_cb->link_id = link_id;
 
 			/* For open mode, skip peer find logic */
-			if (unlikely(ahvif->key_cipher == WMI_CIPHER_NONE))
+			if (unlikely(!ahvif->key_cipher))
 				goto skip_peer_find;
 
 			spin_lock_bh(&tmp_ar->ab->base_lock);
@@ -7529,7 +7531,7 @@ static void ath12k_mac_op_tx(struct ieee80211_hw *hw,
 
 skip_peer_find:
 			ret = ath12k_dp_tx(tmp_ar, tmp_arvif,
-					   msdu_copied, true, mcbc_gsn);
+					   msdu_copied, true, mcbc_gsn, is_mcast);
 			if (unlikely(ret)) {
 				if (ret == -ENOMEM) {
 					/* Drops are expected during heavy multicast
@@ -10804,6 +10806,9 @@ static const struct ieee80211_ops ath12k_ops = {
 	.suspend			= ath12k_wow_op_suspend,
 	.resume				= ath12k_wow_op_resume,
 	.set_wakeup			= ath12k_wow_op_set_wakeup,
+#endif
+#ifdef CONFIG_ATH12K_DEBUGFS
+	.vif_add_debugfs                = ath12k_debugfs_op_vif_add,
 #endif
 	CFG80211_TESTMODE_CMD(ath12k_tm_cmd)
 #ifdef CONFIG_ATH12K_DEBUGFS
