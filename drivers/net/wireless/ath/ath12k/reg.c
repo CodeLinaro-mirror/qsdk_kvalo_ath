@@ -6,6 +6,7 @@
 #include <linux/rtnetlink.h>
 #include "core.h"
 #include "debug.h"
+#include "mac.h"
 
 /* World regdom to be used in case default regd from fw is unavailable */
 #define ATH12K_2GHZ_CH01_11      REG_RULE(2412 - 10, 2462 + 10, 40, 0, 20, 0)
@@ -55,6 +56,24 @@ ath12k_reg_notifier(struct wiphy *wiphy, struct regulatory_request *request)
 
 	ath12k_dbg(ar->ab, ATH12K_DBG_REG,
 		   "Regulatory Notification received for %s\n", wiphy_name(wiphy));
+
+	if (request->initiator == NL80211_REGDOM_SET_BY_DRIVER) {
+		ath12k_dbg(ar->ab, ATH12K_DBG_REG,
+			   "driver initiated regd update\n");
+		if (ah->state != ATH12K_HW_STATE_ON)
+			return;
+
+		for_each_ar(ah, ar, i) {
+			ret = ath12k_reg_update_chan_list(ar, true);
+			if (ret) {
+				ath12k_warn(ar->ab,
+					    "failed to update chan list for pdev %u, ret %d\n",
+					    i, ret);
+				break;
+			}
+		}
+		return;
+	}
 
 	/* Currently supporting only General User Hints. Cell base user
 	 * hints to be handled later.
@@ -246,14 +265,56 @@ static void ath12k_copy_regd(struct ieee80211_regdomain *regd_orig,
 
 int ath12k_regd_update(struct ath12k *ar, bool init)
 {
+	u32 phy_id, freq_low = 0, freq_high = 0, supported_bands, band;
+	struct ath12k_wmi_hal_reg_capabilities_ext_arg *reg_cap;
 	struct ath12k_hw *ah = ath12k_ar_to_ah(ar);
 	struct ieee80211_hw *hw = ah->hw;
 	struct ieee80211_regdomain *regd, *regd_copy = NULL;
 	int ret, regd_len, pdev_id;
 	struct ath12k_base *ab;
-	int i;
 
 	ab = ar->ab;
+
+	supported_bands = ar->pdev->cap.supported_bands;
+	if (supported_bands & WMI_HOST_WLAN_2GHZ_CAP) {
+		band = NL80211_BAND_2GHZ;
+	} else if (supported_bands & WMI_HOST_WLAN_5GHZ_CAP && !ar->supports_6ghz) {
+		band = NL80211_BAND_5GHZ;
+	} else if (supported_bands & WMI_HOST_WLAN_5GHZ_CAP && ar->supports_6ghz) {
+		band = NL80211_BAND_6GHZ;
+	} else {
+		/* This condition is not expected.
+		 */
+		WARN_ON(1);
+		ret = -EINVAL;
+		goto err;
+	}
+
+	reg_cap = &ab->hal_reg_cap[ar->pdev_idx];
+
+	if (ab->hw_params->single_pdev_only && !ar->supports_6ghz) {
+		phy_id = ar->pdev->cap.band[band].phy_id;
+		reg_cap = &ab->hal_reg_cap[phy_id];
+	}
+
+	/* Possible that due to reg change, current limits for supported
+	 * frequency changed. Update that
+	 */
+	if (supported_bands & WMI_HOST_WLAN_2GHZ_CAP) {
+		freq_low = max(reg_cap->low_2ghz_chan, ab->reg_freq_2ghz.start_freq);
+		freq_high = min(reg_cap->high_2ghz_chan, ab->reg_freq_2ghz.end_freq);
+	} else if (supported_bands & WMI_HOST_WLAN_5GHZ_CAP && !ar->supports_6ghz) {
+		freq_low = max(reg_cap->low_5ghz_chan, ab->reg_freq_5ghz.start_freq);
+		freq_high = min(reg_cap->high_5ghz_chan, ab->reg_freq_5ghz.end_freq);
+	} else if (supported_bands & WMI_HOST_WLAN_5GHZ_CAP && ar->supports_6ghz) {
+		freq_low = max(reg_cap->low_5ghz_chan, ab->reg_freq_6ghz.start_freq);
+		freq_high = min(reg_cap->high_5ghz_chan, ab->reg_freq_6ghz.end_freq);
+	}
+
+	ath12k_mac_update_freq_range(ar, freq_low, freq_high);
+
+	ath12k_dbg(ab, ATH12K_DBG_REG, "pdev %u reg updated freq limits %u->%u MHz\n",
+		   ar->pdev->pdev_id, freq_low, freq_high);
 
 	/* If one of the radios within ah has already updated the regd for
 	 * the wiphy, then avoid setting regd again
@@ -315,11 +376,7 @@ int ath12k_regd_update(struct ath12k *ar, bool init)
 		goto err;
 	}
 
-	rtnl_lock();
-	wiphy_lock(hw->wiphy);
-	ret = regulatory_set_wiphy_regd_sync(hw->wiphy, regd_copy);
-	wiphy_unlock(hw->wiphy);
-	rtnl_unlock();
+	ret = regulatory_set_wiphy_regd(hw->wiphy, regd_copy);
 
 	kfree(regd_copy);
 
@@ -330,15 +387,7 @@ int ath12k_regd_update(struct ath12k *ar, bool init)
 		goto skip;
 
 	ah->regd_updated = true;
-	/* Apply the new regd to all the radios, this is expected to be received only once
-	 * since we check for ah->regd_updated and allow here only once.
-	 */
-	for_each_ar(ah, ar, i) {
-		ab = ar->ab;
-		ret = ath12k_reg_update_chan_list(ar, true);
-		if (ret)
-			goto err;
-	}
+
 skip:
 	return 0;
 err:
@@ -651,6 +700,16 @@ ath12k_reg_update_weather_radar_band(struct ath12k_base *ab,
 	*rule_idx = i;
 }
 
+static void ath12k_reg_update_freq_range(struct ath12k_reg_freq *reg_freq,
+					 struct ath12k_reg_rule *reg_rule)
+{
+	if (reg_freq->start_freq > reg_rule->start_freq)
+		reg_freq->start_freq = reg_rule->start_freq;
+
+	if (reg_freq->end_freq < reg_rule->end_freq)
+		reg_freq->end_freq = reg_rule->end_freq;
+}
+
 struct ieee80211_regdomain *
 ath12k_reg_build_regd(struct ath12k_base *ab,
 		      struct ath12k_reg_info *reg_info, bool intersect)
@@ -694,6 +753,16 @@ ath12k_reg_build_regd(struct ath12k_base *ab,
 		   "\r\nCountry %s, CFG Regdomain %s FW Regdomain %d, num_reg_rules %d\n",
 		   alpha2, ath12k_reg_get_regdom_str(tmp_regd->dfs_region),
 		   reg_info->dfs_region, num_rules);
+
+	/* Reset start and end frequency for each band
+	 */
+	ab->reg_freq_5ghz.start_freq = INT_MAX;
+	ab->reg_freq_5ghz.end_freq = 0;
+	ab->reg_freq_2ghz.start_freq = INT_MAX;
+	ab->reg_freq_2ghz.end_freq = 0;
+	ab->reg_freq_6ghz.start_freq = INT_MAX;
+	ab->reg_freq_6ghz.end_freq = 0;
+
 	/* Update reg_rules[] below. Firmware is expected to
 	 * send these rules in order(2G rules first and then 5G)
 	 */
@@ -704,6 +773,7 @@ ath12k_reg_build_regd(struct ath12k_base *ab,
 			max_bw = min_t(u16, reg_rule->max_bw,
 				       reg_info->max_bw_2g);
 			flags = 0;
+			ath12k_reg_update_freq_range(&ab->reg_freq_2ghz, reg_rule);
 		} else if (reg_info->num_5g_reg_rules &&
 			   (j < reg_info->num_5g_reg_rules)) {
 			reg_rule = reg_info->reg_rules_5g_ptr + j++;
@@ -717,6 +787,7 @@ ath12k_reg_build_regd(struct ath12k_base *ab,
 			 * per other BW rule flags we pass from here
 			 */
 			flags = NL80211_RRF_AUTO_BW;
+			ath12k_reg_update_freq_range(&ab->reg_freq_5ghz, reg_rule);
 		} else if (reg_info->is_ext_reg_event &&
 			   reg_info->num_6g_reg_rules_ap[WMI_REG_INDOOR_AP] &&
 			(k < reg_info->num_6g_reg_rules_ap[WMI_REG_INDOOR_AP])) {
@@ -724,6 +795,7 @@ ath12k_reg_build_regd(struct ath12k_base *ab,
 			max_bw = min_t(u16, reg_rule->max_bw,
 				       reg_info->max_bw_6g_ap[WMI_REG_INDOOR_AP]);
 			flags = NL80211_RRF_AUTO_BW;
+			ath12k_reg_update_freq_range(&ab->reg_freq_6ghz, reg_rule);
 		} else {
 			break;
 		}
@@ -810,6 +882,7 @@ void ath12k_regd_update_work(struct work_struct *work)
 void ath12k_reg_init(struct ieee80211_hw *hw)
 {
 	hw->wiphy->regulatory_flags = REGULATORY_WIPHY_SELF_MANAGED;
+	hw->wiphy->flags |= WIPHY_FLAG_NOTIFY_REGDOM_BY_DRIVER;
 	hw->wiphy->reg_notifier = ath12k_reg_notifier;
 }
 
