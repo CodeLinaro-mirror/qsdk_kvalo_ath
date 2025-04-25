@@ -194,6 +194,22 @@ static void ath12k_dp_rxdesc_set_msdu_len(struct ath12k_base *ab,
 	ab->hal_rx_ops->rx_desc_set_msdu_len(desc, len);
 }
 
+u32 ath12k_dp_rxdesc_get_ppduid(struct ath12k_base *ab,
+				struct hal_rx_desc *rx_desc)
+{
+	return ab->hal_rx_ops->rx_desc_get_mpdu_ppdu_id(rx_desc);
+}
+
+bool ath12k_dp_rxdesc_mpdu_valid(struct ath12k_base *ab,
+				 struct hal_rx_desc *rx_desc)
+{
+	u32 tlv_tag;
+
+	tlv_tag = ab->hal_rx_ops->rx_desc_get_mpdu_start_tag(rx_desc);
+
+	return tlv_tag == HAL_RX_MPDU_START;
+}
+
 static bool ath12k_dp_rx_h_is_da_mcbc(struct ath12k_base *ab,
 				      struct hal_rx_desc *desc)
 {
@@ -414,8 +430,16 @@ static int ath12k_dp_rxdma_mon_buf_ring_free(struct ath12k_base *ab,
 static int ath12k_dp_rxdma_buf_free(struct ath12k_base *ab)
 {
 	struct ath12k_dp *dp = &ab->dp;
+	int i;
 
 	ath12k_dp_rxdma_mon_buf_ring_free(ab, &dp->rxdma_mon_buf_ring);
+
+	if (ab->hw_params->rxdma1_enable)
+		return 0;
+
+	for (i = 0; i < ab->hw_params->num_rxdma_per_pdev; i++)
+		ath12k_dp_rxdma_mon_buf_ring_free(ab,
+						  &dp->rx_mon_status_refill_ring[i]);
 
 	return 0;
 }
@@ -430,7 +454,12 @@ static int ath12k_dp_rxdma_mon_ring_buf_setup(struct ath12k_base *ab,
 		ath12k_hal_srng_get_entrysize(ab, ringtype);
 
 	rx_ring->bufs_max = num_entries;
-	ath12k_dp_mon_buf_replenish(ab, rx_ring, num_entries);
+
+	if (ringtype == HAL_RXDMA_MONITOR_STATUS)
+		ath12k_dp_mon_status_bufs_replenish(ab, rx_ring,
+						    num_entries);
+	else
+		ath12k_dp_mon_buf_replenish(ab, rx_ring, num_entries);
 
 	return 0;
 }
@@ -451,7 +480,8 @@ static int ath12k_dp_rxdma_ring_buf_setup(struct ath12k_base *ab,
 static int ath12k_dp_rxdma_buf_setup(struct ath12k_base *ab)
 {
 	struct ath12k_dp *dp = &ab->dp;
-	int ret;
+	struct dp_rxdma_mon_ring *mon_ring;
+	int ret, i;
 
 	ret = ath12k_dp_rxdma_ring_buf_setup(ab, &dp->rx_refill_buf_ring);
 	if (ret) {
@@ -464,9 +494,19 @@ static int ath12k_dp_rxdma_buf_setup(struct ath12k_base *ab)
 		ret = ath12k_dp_rxdma_mon_ring_buf_setup(ab,
 							 &dp->rxdma_mon_buf_ring,
 							 HAL_RXDMA_MONITOR_BUF);
-		if (ret) {
+		if (ret)
 			ath12k_warn(ab,
 				    "failed to setup HAL_RXDMA_MONITOR_BUF\n");
+		return ret;
+	}
+
+	for (i = 0; i < ab->hw_params->num_rxdma_per_pdev; i++) {
+		mon_ring = &dp->rx_mon_status_refill_ring[i];
+		ret = ath12k_dp_rxdma_mon_ring_buf_setup(ab, mon_ring,
+							 HAL_RXDMA_MONITOR_STATUS);
+		if (ret) {
+			ath12k_warn(ab,
+				    "failed to setup HAL_RXDMA_MONITOR_STATUS\n");
 			return ret;
 		}
 	}
@@ -819,15 +859,10 @@ void ath12k_dp_rx_peer_tid_delete(struct ath12k *ar,
 	rx_tid->active = false;
 }
 
-/* TODO: it's strange (and ugly) that struct hal_reo_dest_ring is converted
- * to struct hal_wbm_release_ring, I couldn't figure out the logic behind
- * that.
- */
-static int ath12k_dp_rx_link_desc_return(struct ath12k_base *ab,
-					 struct hal_reo_dest_ring *ring,
-					 enum hal_wbm_rel_bm_act action)
+int ath12k_dp_rx_link_desc_return(struct ath12k_base *ab,
+				  struct ath12k_buffer_addr *buf_addr_info,
+				  enum hal_wbm_rel_bm_act action)
 {
-	struct hal_wbm_release_ring *link_desc = (struct hal_wbm_release_ring *)ring;
 	struct hal_wbm_release_ring *desc;
 	struct ath12k_dp *dp = &ab->dp;
 	struct hal_srng *srng;
@@ -845,7 +880,7 @@ static int ath12k_dp_rx_link_desc_return(struct ath12k_base *ab,
 		goto exit;
 	}
 
-	ath12k_hal_rx_msdu_link_desc_set(ab, desc, link_desc, action);
+	ath12k_hal_rx_msdu_link_desc_set(ab, desc, buf_addr_info, action);
 
 exit:
 	ath12k_hal_srng_access_end(ab, srng);
@@ -858,14 +893,17 @@ exit:
 static void ath12k_dp_rx_frags_cleanup(struct ath12k_dp_rx_tid *rx_tid,
 				       bool rel_link_desc)
 {
+	struct ath12k_buffer_addr *buf_addr_info;
 	struct ath12k_base *ab = rx_tid->ab;
 
 	lockdep_assert_held(&ab->base_lock);
 
 	if (rx_tid->dst_ring_desc) {
-		if (rel_link_desc)
-			ath12k_dp_rx_link_desc_return(ab, rx_tid->dst_ring_desc,
+		if (rel_link_desc) {
+			buf_addr_info = &rx_tid->dst_ring_desc->buf_addr_info;
+			ath12k_dp_rx_link_desc_return(ab, buf_addr_info,
 						      HAL_WBM_REL_BM_ACT_PUT_IN_IDLE);
+		}
 		kfree(rx_tid->dst_ring_desc);
 		rx_tid->dst_ring_desc = NULL;
 	}
@@ -3483,7 +3521,7 @@ static int ath12k_dp_rx_frag_h_mpdu(struct ath12k *ar,
 			goto out_unlock;
 		}
 	} else {
-		ath12k_dp_rx_link_desc_return(ab, ring_desc,
+		ath12k_dp_rx_link_desc_return(ab, &ring_desc->buf_addr_info,
 					      HAL_WBM_REL_BM_ACT_PUT_IN_IDLE);
 	}
 
@@ -3596,7 +3634,7 @@ ath12k_dp_process_rx_err_buf(struct ath12k *ar, struct hal_reo_dest_ring *desc,
 
 	if (ath12k_dp_rx_frag_h_mpdu(ar, msdu, desc)) {
 		dev_kfree_skb_any(msdu);
-		ath12k_dp_rx_link_desc_return(ar->ab, desc,
+		ath12k_dp_rx_link_desc_return(ar->ab, &desc->buf_addr_info,
 					      HAL_WBM_REL_BM_ACT_PUT_IN_IDLE);
 	}
 exit:
@@ -3675,7 +3713,8 @@ int ath12k_dp_rx_process_err(struct ath12k_base *ab, struct napi_struct *napi,
 		    rbm != partner_ab->hw_params->hal_params->rx_buf_rbm) {
 			ab->soc_stats.invalid_rbm++;
 			ath12k_warn(ab, "invalid return buffer manager %d\n", rbm);
-			ath12k_dp_rx_link_desc_return(partner_ab, reo_desc,
+			ath12k_dp_rx_link_desc_return(partner_ab,
+						      &reo_desc->buf_addr_info,
 						      HAL_WBM_REL_BM_ACT_REL_MSDU);
 			continue;
 		}
@@ -3693,7 +3732,8 @@ int ath12k_dp_rx_process_err(struct ath12k_base *ab, struct napi_struct *napi,
 			drop = true;
 
 			/* Return the link desc back to wbm idle list */
-			ath12k_dp_rx_link_desc_return(partner_ab, reo_desc,
+			ath12k_dp_rx_link_desc_return(partner_ab,
+						      &reo_desc->buf_addr_info,
 						      HAL_WBM_REL_BM_ACT_PUT_IN_IDLE);
 		}
 
@@ -4244,6 +4284,7 @@ void ath12k_dp_rx_process_reo_status(struct ath12k_base *ab)
 void ath12k_dp_rx_free(struct ath12k_base *ab)
 {
 	struct ath12k_dp *dp = &ab->dp;
+	struct dp_srng *srng;
 	int i;
 
 	ath12k_dp_srng_cleanup(ab, &dp->rx_refill_buf_ring.refill_buf_ring);
@@ -4251,6 +4292,10 @@ void ath12k_dp_rx_free(struct ath12k_base *ab)
 	for (i = 0; i < ab->hw_params->num_rxdma_per_pdev; i++) {
 		if (ab->hw_params->rx_mac_buf_ring)
 			ath12k_dp_srng_cleanup(ab, &dp->rx_mac_buf_ring[i]);
+		if (!ab->hw_params->rxdma1_enable) {
+			srng = &dp->rx_mon_status_refill_ring[i].refill_buf_ring;
+			ath12k_dp_srng_cleanup(ab, srng);
+		}
 	}
 
 	for (i = 0; i < ab->hw_params->num_rxdma_dst_ring; i++)
@@ -4399,6 +4444,19 @@ int ath12k_dp_rx_htt_setup(struct ath12k_base *ab)
 				    ret);
 			return ret;
 		}
+	} else {
+		for (i = 0; i < ab->hw_params->num_rxdma_per_pdev; i++) {
+			ring_id =
+				dp->rx_mon_status_refill_ring[i].refill_buf_ring.ring_id;
+			ret = ath12k_dp_tx_htt_srng_setup(ab, ring_id, i,
+							  HAL_RXDMA_MONITOR_STATUS);
+			if (ret) {
+				ath12k_warn(ab,
+					    "failed to configure mon_status_refill_ring%d %d\n",
+					    i, ret);
+				return ret;
+			}
+		}
 	}
 
 	ret = ab->hw_params->hw_ops->rxdma_ring_sel_config(ab);
@@ -4413,6 +4471,7 @@ int ath12k_dp_rx_htt_setup(struct ath12k_base *ab)
 int ath12k_dp_rx_alloc(struct ath12k_base *ab)
 {
 	struct ath12k_dp *dp = &ab->dp;
+	struct dp_srng *srng;
 	int i, ret;
 
 	idr_init(&dp->rxdma_mon_buf_ring.bufs_idr);
@@ -4459,6 +4518,23 @@ int ath12k_dp_rx_alloc(struct ath12k_base *ab)
 		if (ret) {
 			ath12k_warn(ab, "failed to setup HAL_RXDMA_MONITOR_BUF\n");
 			return ret;
+		}
+	} else {
+		for (i = 0; i < ab->hw_params->num_rxdma_per_pdev; i++) {
+			idr_init(&dp->rx_mon_status_refill_ring[i].bufs_idr);
+			spin_lock_init(&dp->rx_mon_status_refill_ring[i].idr_lock);
+		}
+
+		for (i = 0; i < ab->hw_params->num_rxdma_per_pdev; i++) {
+			srng = &dp->rx_mon_status_refill_ring[i].refill_buf_ring;
+			ret = ath12k_dp_srng_setup(ab, srng,
+						   HAL_RXDMA_MONITOR_STATUS, 0, i,
+						   DP_RXDMA_MON_STATUS_RING_SIZE);
+			if (ret) {
+				ath12k_warn(ab, "failed to setup mon status ring %d\n",
+					    i);
+				return ret;
+			}
 		}
 	}
 
@@ -4530,17 +4606,15 @@ int ath12k_dp_rx_pdev_mon_attach(struct ath12k *ar)
 		return ret;
 	}
 
-	/* if rxdma1_enable is false, no need to setup
-	 * rxdma_mon_desc_ring.
-	 */
+	pmon->mon_last_linkdesc_paddr = 0;
+	pmon->mon_last_buf_cookie = DP_RX_DESC_COOKIE_MAX + 1;
+	spin_lock_init(&pmon->mon_lock);
+
 	if (!ar->ab->hw_params->rxdma1_enable)
 		return 0;
 
-	pmon->mon_last_linkdesc_paddr = 0;
-	pmon->mon_last_buf_cookie = DP_RX_DESC_COOKIE_MAX + 1;
 	INIT_LIST_HEAD(&pmon->dp_rx_mon_mpdu_list);
 	pmon->mon_mpdu = NULL;
-	spin_lock_init(&pmon->mon_lock);
 
 	return 0;
 }
