@@ -811,6 +811,8 @@ static int ath12k_core_soc_create(struct ath12k_base *ab)
 		goto err_qmi_deinit;
 	}
 
+	ath12k_debugfs_pdev_create(ab);
+
 	return 0;
 
 err_qmi_deinit:
@@ -1834,9 +1836,9 @@ static int ath12k_core_get_wsi_info(struct ath12k_hw_group *ag,
 		of_node_put(next_rx_endpoint);
 
 		device_count++;
-		if (device_count > ATH12K_MAX_SOCS) {
+		if (device_count > ATH12K_MAX_DEVICES) {
 			ath12k_warn(ab, "device count in DT %d is more than limit %d\n",
-				    device_count, ATH12K_MAX_SOCS);
+				    device_count, ATH12K_MAX_DEVICES);
 			of_node_put(next_wsi_dev);
 			return -EINVAL;
 		}
@@ -2012,7 +2014,7 @@ static void ath12k_core_hw_group_destroy(struct ath12k_hw_group *ag)
 	}
 }
 
-static void ath12k_core_hw_group_cleanup(struct ath12k_hw_group *ag)
+void ath12k_core_hw_group_cleanup(struct ath12k_hw_group *ag)
 {
 	struct ath12k_base *ab;
 	int i;
@@ -2158,10 +2160,9 @@ err:
 
 void ath12k_core_deinit(struct ath12k_base *ab)
 {
-	ath12k_core_panic_notifier_unregister(ab);
-	ath12k_core_hw_group_cleanup(ab->ag);
 	ath12k_core_hw_group_destroy(ab->ag);
 	ath12k_core_hw_group_unassign(ab);
+	ath12k_core_panic_notifier_unregister(ab);
 }
 
 void ath12k_core_free(struct ath12k_base *ab)

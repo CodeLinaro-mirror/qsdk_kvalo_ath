@@ -229,7 +229,8 @@ ath12k_phymodes[NUM_NL80211_BANDS][ATH12K_CHAN_WIDTH_NUM] = {
 const struct htt_rx_ring_tlv_filter ath12k_mac_mon_status_filter_default = {
 	.rx_filter = HTT_RX_FILTER_TLV_FLAGS_MPDU_START |
 		     HTT_RX_FILTER_TLV_FLAGS_PPDU_END |
-		     HTT_RX_FILTER_TLV_FLAGS_PPDU_END_STATUS_DONE,
+		     HTT_RX_FILTER_TLV_FLAGS_PPDU_END_STATUS_DONE |
+		     HTT_RX_FILTER_TLV_FLAGS_PPDU_START_USER_INFO,
 	.pkt_filter_flags0 = HTT_RX_FP_MGMT_FILTER_FLAGS0,
 	.pkt_filter_flags1 = HTT_RX_FP_MGMT_FILTER_FLAGS1,
 	.pkt_filter_flags2 = HTT_RX_FP_CTRL_FILTER_FLASG2,
@@ -4656,6 +4657,7 @@ static int ath12k_mac_op_hw_scan(struct ieee80211_hw *hw,
 		spin_lock_bh(&ar->data_lock);
 		ar->scan.state = ATH12K_SCAN_IDLE;
 		spin_unlock_bh(&ar->data_lock);
+		goto exit;
 	}
 
 	ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "mac scan started");
@@ -11836,6 +11838,7 @@ static void ath12k_mac_hw_unregister(struct ath12k_hw *ah)
 	for_each_ar(ah, ar, i) {
 		cancel_work_sync(&ar->regd_update_work);
 		ath12k_debugfs_unregister(ar);
+		ath12k_fw_stats_reset(ar);
 	}
 
 	ieee80211_unregister_hw(hw);
