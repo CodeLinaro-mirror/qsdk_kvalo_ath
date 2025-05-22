@@ -74,6 +74,8 @@ struct ath12k_generic_iter {
 #define HECAP_PHY_ULOFDMA_GET(hecap_phy) \
 	u8_get_bits(hecap_phy[2], IEEE80211_HE_PHY_CAP2_UL_MU_PARTIAL_MU_MIMO)
 
+#define ATH12K_NUM_MAX_ACTIVE_LINKS_PER_DEVICE	2
+
 enum ath12k_supported_bw {
 	ATH12K_BW_20    = 0,
 	ATH12K_BW_40    = 1,
