@@ -349,6 +349,7 @@ struct ath12k_link_vif {
 	bool group_key_valid;
 	struct wmi_vdev_install_key_arg group_key;
 	bool pairwise_key_done;
+	u16 num_stations;
 };
 
 struct ath12k_vif {
@@ -563,6 +564,8 @@ struct ath12k_link_sta {
 
 	 /* for firmware use only */
 	u8 link_idx;
+	u32 tx_retry_failed;
+	u32 tx_retry_count;
 };
 
 struct ath12k_reoq_buf {
