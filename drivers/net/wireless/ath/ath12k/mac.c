@@ -6375,7 +6375,7 @@ static int ath12k_mac_station_add(struct ath12k *ar,
 	struct ath12k_base *ab = ar->ab;
 	struct ieee80211_vif *vif = ath12k_ahvif_to_vif(arvif->ahvif);
 	struct ieee80211_sta *sta = ath12k_ahsta_to_sta(arsta->ahsta);
-	struct ath12k_wmi_peer_create_arg peer_param = {0};
+	struct ath12k_wmi_peer_create_arg peer_param = {};
 	int ret;
 
 	lockdep_assert_wiphy(ath12k_ar_to_hw(ar)->wiphy);
@@ -6719,7 +6719,7 @@ static int ath12k_mac_mlo_sta_set_link_active(struct ath12k_base *ab,
 					      u8 *mlo_inactive_vdev_lst,
 					      u8 num_mlo_inactive_vdev)
 {
-	struct wmi_mlo_link_set_active_arg param = {0};
+	struct wmi_mlo_link_set_active_arg param = {};
 	u32 entry_idx, entry_offset, vdev_idx;
 	u8 vdev_id;
 
@@ -6781,8 +6781,8 @@ static int ath12k_mac_mlo_sta_update_link_active(struct ath12k_base *ab,
 						 struct ieee80211_hw *hw,
 						 struct ath12k_vif *ahvif)
 {
-	u8 mlo_vdev_id_lst[IEEE80211_MLD_MAX_NUM_LINKS] = {0};
-	u32 mlo_freq_list[IEEE80211_MLD_MAX_NUM_LINKS] = {0};
+	u8 mlo_vdev_id_lst[IEEE80211_MLD_MAX_NUM_LINKS] = {};
+	u32 mlo_freq_list[IEEE80211_MLD_MAX_NUM_LINKS] = {};
 	unsigned long links = ahvif->links_map;
 	enum wmi_mlo_link_force_reason reason;
 	struct ieee80211_chanctx_conf *conf;
@@ -7519,7 +7519,7 @@ static struct ieee80211_sta_ht_cap
 ath12k_create_ht_cap(struct ath12k *ar, u32 ar_ht_cap, u32 rate_cap_rx_chainmask)
 {
 	int i;
-	struct ieee80211_sta_ht_cap ht_cap = {0};
+	struct ieee80211_sta_ht_cap ht_cap = {};
 	u32 ar_vht_cap = ar->pdev->cap.vht_cap;
 
 	if (!(ar_ht_cap & WMI_HT_CAP_ENABLED))
@@ -7675,7 +7675,7 @@ static struct ieee80211_sta_vht_cap
 ath12k_create_vht_cap(struct ath12k *ar, u32 rate_cap_tx_chainmask,
 		      u32 rate_cap_rx_chainmask)
 {
-	struct ieee80211_sta_vht_cap vht_cap = {0};
+	struct ieee80211_sta_vht_cap vht_cap = {};
 	u16 txmcs_map, rxmcs_map;
 	int i;
 
@@ -9682,8 +9682,8 @@ int ath12k_mac_vdev_create(struct ath12k *ar, struct ath12k_link_vif *arvif)
 	struct ieee80211_hw *hw = ah->hw;
 	struct ath12k_vif *ahvif = arvif->ahvif;
 	struct ieee80211_vif *vif = ath12k_ahvif_to_vif(ahvif);
-	struct ath12k_wmi_vdev_create_arg vdev_arg = {0};
-	struct ath12k_wmi_peer_create_arg peer_param = {0};
+	struct ath12k_wmi_vdev_create_arg vdev_arg = {};
+	struct ath12k_wmi_peer_create_arg peer_param = {};
 	struct ieee80211_bss_conf *link_conf = NULL;
 	u32 param_id, param_value;
 	u16 nss;
@@ -13365,16 +13365,12 @@ ath12k_mac_setup_radio_iface_comb(struct ath12k *ar,
 	comb[0].beacon_int_infra_match = true;
 	comb[0].beacon_int_min_gcd = 100;
 
-	if (ar->ab->hw_params->single_pdev_only) {
-		comb[0].num_different_channels = 2;
-	} else {
-		comb[0].num_different_channels = 1;
-		comb[0].radar_detect_widths = BIT(NL80211_CHAN_WIDTH_20_NOHT) |
-						BIT(NL80211_CHAN_WIDTH_20) |
-						BIT(NL80211_CHAN_WIDTH_40) |
-						BIT(NL80211_CHAN_WIDTH_80) |
-						BIT(NL80211_CHAN_WIDTH_160);
-	}
+	comb[0].num_different_channels = 1;
+	comb[0].radar_detect_widths = BIT(NL80211_CHAN_WIDTH_20_NOHT) |
+				      BIT(NL80211_CHAN_WIDTH_20) |
+				      BIT(NL80211_CHAN_WIDTH_40) |
+				      BIT(NL80211_CHAN_WIDTH_80) |
+				      BIT(NL80211_CHAN_WIDTH_160);
 
 	return 0;
 }
@@ -13457,24 +13453,41 @@ static int ath12k_mac_setup_iface_combinations(struct ath12k_hw *ah)
 	struct ieee80211_iface_combination *combinations, *comb;
 	struct wiphy *wiphy = ah->hw->wiphy;
 	struct wiphy_radio *radio;
+	int n_combinations = 1;
 	struct ath12k *ar;
 	int i, ret;
 
-	combinations = kzalloc(sizeof(*combinations), GFP_KERNEL);
-	if (!combinations)
-		return -ENOMEM;
-
 	if (ah->num_radio == 1) {
-		ret = ath12k_mac_setup_radio_iface_comb(&ah->radio[0],
-							combinations);
+		ar = &ah->radio[0];
+
+		if (ar->ab->hw_params->single_pdev_only)
+			n_combinations = 2;
+
+		combinations = kcalloc(n_combinations, sizeof(*combinations),
+				       GFP_KERNEL);
+		if (!combinations)
+			return -ENOMEM;
+
+		ret = ath12k_mac_setup_radio_iface_comb(ar, combinations);
 		if (ret) {
 			ath12k_hw_warn(ah, "failed to setup radio interface combinations for one radio: %d",
 				       ret);
 			goto err_free_combinations;
 		}
 
+		if (ar->ab->hw_params->single_pdev_only) {
+			comb = combinations + 1;
+			memcpy(comb, combinations, sizeof(*comb));
+			comb->num_different_channels = 2;
+			comb->radar_detect_widths = 0;
+		}
+
 		goto out;
 	}
+
+	combinations = kcalloc(n_combinations, sizeof(*combinations), GFP_KERNEL);
+	if (!combinations)
+		return -ENOMEM;
 
 	/* there are multiple radios */
 
@@ -13518,7 +13531,7 @@ static int ath12k_mac_setup_iface_combinations(struct ath12k_hw *ah)
 
 out:
 	wiphy->iface_combinations = combinations;
-	wiphy->n_iface_combinations = 1;
+	wiphy->n_iface_combinations = n_combinations;
 
 	return 0;
 
