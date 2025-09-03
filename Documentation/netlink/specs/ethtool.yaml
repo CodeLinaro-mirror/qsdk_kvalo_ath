@@ -205,6 +205,9 @@ definitions:
       -
         name: gtp-teid
       -
+        name: ip6-fl
+        doc: IPv6 Flow Label
+      -
         name: discard
         value: 31
 
@@ -2344,14 +2347,14 @@ operations:
         request:
           attributes:
             - header
-        reply:
-          attributes:
-            - header
             - offset
             - length
             - page
             - bank
             - i2c-address
+        reply:
+          attributes:
+            - header
             - data
       dump: *module-eeprom-get-op
     -
