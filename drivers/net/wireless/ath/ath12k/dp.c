@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 /*
  * Copyright (c) 2018-2021 The Linux Foundation. All rights reserved.
- * Copyright (c) 2021-2025 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <crypto/hash.h>
 #include "core.h"
 #include "dp_tx.h"
-#include "hal_tx.h"
+#include "wifi7/hal_tx.h"
 #include "hif.h"
 #include "debug.h"
-#include "dp_rx.h"
+#include "wifi7/dp_rx.h"
 #include "peer.h"
 #include "dp_mon.h"
 
@@ -18,12 +18,6 @@ enum ath12k_dp_desc_type {
 	ATH12K_DP_TX_DESC,
 	ATH12K_DP_RX_DESC,
 };
-
-static void ath12k_dp_htt_htc_tx_complete(struct ath12k_base *ab,
-					  struct sk_buff *skb)
-{
-	dev_kfree_skb_any(skb);
-}
 
 void ath12k_dp_peer_cleanup(struct ath12k *ar, int vdev_id, const u8 *addr)
 {
@@ -84,7 +78,6 @@ int ath12k_dp_peer_setup(struct ath12k *ar, int vdev_id, const u8 *addr)
 	ret = ath12k_dp_rx_peer_frag_setup(ar, addr, vdev_id);
 	if (ret) {
 		ath12k_warn(ab, "failed to setup rx defrag context\n");
-		tid--;
 		goto peer_clean;
 	}
 
@@ -102,7 +95,7 @@ peer_clean:
 		return -ENOENT;
 	}
 
-	for (; tid >= 0; tid--)
+	for (tid--; tid >= 0; tid--)
 		ath12k_dp_rx_peer_tid_delete(ar, peer, tid);
 
 	spin_unlock_bh(&ab->base_lock);
@@ -242,7 +235,7 @@ int ath12k_dp_srng_setup(struct ath12k_base *ab, struct dp_srng *ring,
 			 enum hal_ring_type type, int ring_num,
 			 int mac_id, int num_entries)
 {
-	struct hal_srng_params params = { 0 };
+	struct hal_srng_params params = {};
 	int entry_sz = ath12k_hal_srng_get_entrysize(ab, type);
 	int max_entries = ath12k_hal_srng_get_max_entries(ab, type);
 	int ret;
@@ -521,7 +514,7 @@ static int ath12k_dp_srng_common_setup(struct ath12k_base *ab)
 
 		ret = ath12k_dp_srng_setup(ab, &dp->tx_ring[i].tcl_comp_ring,
 					   HAL_WBM2SW_RELEASE, tx_comp_ring_num, 0,
-					   DP_TX_COMP_RING_SIZE);
+					   DP_TX_COMP_RING_SIZE(ab));
 		if (ret) {
 			ath12k_warn(ab, "failed to set up tcl_comp ring (%d) :%d\n",
 				    tx_comp_ring_num, ret);
@@ -884,130 +877,6 @@ fail_desc_bank_free:
 	return ret;
 }
 
-int ath12k_dp_service_srng(struct ath12k_base *ab,
-			   struct ath12k_ext_irq_grp *irq_grp,
-			   int budget)
-{
-	struct napi_struct *napi = &irq_grp->napi;
-	int grp_id = irq_grp->grp_id;
-	int work_done = 0;
-	int i = 0, j;
-	int tot_work_done = 0;
-	enum dp_monitor_mode monitor_mode;
-	u8 ring_mask;
-
-	if (ab->hw_params->ring_mask->tx[grp_id]) {
-		i = fls(ab->hw_params->ring_mask->tx[grp_id]) - 1;
-		ath12k_dp_tx_completion_handler(ab, i);
-	}
-
-	if (ab->hw_params->ring_mask->rx_err[grp_id]) {
-		work_done = ath12k_dp_rx_process_err(ab, napi, budget);
-		budget -= work_done;
-		tot_work_done += work_done;
-		if (budget <= 0)
-			goto done;
-	}
-
-	if (ab->hw_params->ring_mask->rx_wbm_rel[grp_id]) {
-		work_done = ath12k_dp_rx_process_wbm_err(ab,
-							 napi,
-							 budget);
-		budget -= work_done;
-		tot_work_done += work_done;
-
-		if (budget <= 0)
-			goto done;
-	}
-
-	if (ab->hw_params->ring_mask->rx[grp_id]) {
-		i = fls(ab->hw_params->ring_mask->rx[grp_id]) - 1;
-		work_done = ath12k_dp_rx_process(ab, i, napi,
-						 budget);
-		budget -= work_done;
-		tot_work_done += work_done;
-		if (budget <= 0)
-			goto done;
-	}
-
-	if (ab->hw_params->ring_mask->rx_mon_status[grp_id]) {
-		ring_mask = ab->hw_params->ring_mask->rx_mon_status[grp_id];
-		for (i = 0; i < ab->num_radios; i++) {
-			for (j = 0; j < ab->hw_params->num_rxdma_per_pdev; j++) {
-				int id = i * ab->hw_params->num_rxdma_per_pdev + j;
-
-				if (ring_mask & BIT(id)) {
-					work_done =
-					ath12k_dp_mon_process_ring(ab, id, napi, budget,
-								   0);
-					budget -= work_done;
-					tot_work_done += work_done;
-					if (budget <= 0)
-						goto done;
-				}
-			}
-		}
-	}
-
-	if (ab->hw_params->ring_mask->rx_mon_dest[grp_id]) {
-		monitor_mode = ATH12K_DP_RX_MONITOR_MODE;
-		ring_mask = ab->hw_params->ring_mask->rx_mon_dest[grp_id];
-		for (i = 0; i < ab->num_radios; i++) {
-			for (j = 0; j < ab->hw_params->num_rxdma_per_pdev; j++) {
-				int id = i * ab->hw_params->num_rxdma_per_pdev + j;
-
-				if (ring_mask & BIT(id)) {
-					work_done =
-					ath12k_dp_mon_process_ring(ab, id, napi, budget,
-								   monitor_mode);
-					budget -= work_done;
-					tot_work_done += work_done;
-
-					if (budget <= 0)
-						goto done;
-				}
-			}
-		}
-	}
-
-	if (ab->hw_params->ring_mask->tx_mon_dest[grp_id]) {
-		monitor_mode = ATH12K_DP_TX_MONITOR_MODE;
-		ring_mask = ab->hw_params->ring_mask->tx_mon_dest[grp_id];
-		for (i = 0; i < ab->num_radios; i++) {
-			for (j = 0; j < ab->hw_params->num_rxdma_per_pdev; j++) {
-				int id = i * ab->hw_params->num_rxdma_per_pdev + j;
-
-				if (ring_mask & BIT(id)) {
-					work_done =
-					ath12k_dp_mon_process_ring(ab, id, napi, budget,
-								   monitor_mode);
-					budget -= work_done;
-					tot_work_done += work_done;
-
-					if (budget <= 0)
-						goto done;
-				}
-			}
-		}
-	}
-
-	if (ab->hw_params->ring_mask->reo_status[grp_id])
-		ath12k_dp_rx_process_reo_status(ab);
-
-	if (ab->hw_params->ring_mask->host2rxdma[grp_id]) {
-		struct ath12k_dp *dp = &ab->dp;
-		struct dp_rxdma_ring *rx_ring = &dp->rx_refill_buf_ring;
-		LIST_HEAD(list);
-
-		ath12k_dp_rx_bufs_replenish(ab, rx_ring, &list, 0);
-	}
-
-	/* TODO: Implement handler for other interrupts */
-
-done:
-	return tot_work_done;
-}
-
 void ath12k_dp_pdev_free(struct ath12k_base *ab)
 {
 	int i;
@@ -1082,29 +951,6 @@ out:
 	return ret;
 }
 
-int ath12k_dp_htt_connect(struct ath12k_dp *dp)
-{
-	struct ath12k_htc_svc_conn_req conn_req = {0};
-	struct ath12k_htc_svc_conn_resp conn_resp = {0};
-	int status;
-
-	conn_req.ep_ops.ep_tx_complete = ath12k_dp_htt_htc_tx_complete;
-	conn_req.ep_ops.ep_rx_complete = ath12k_dp_htt_htc_t2h_msg_handler;
-
-	/* connect to control service */
-	conn_req.service_id = ATH12K_HTC_SVC_ID_HTT_DATA_MSG;
-
-	status = ath12k_htc_connect_service(&dp->ab->htc, &conn_req,
-					    &conn_resp);
-
-	if (status)
-		return status;
-
-	dp->eid = conn_resp.eid;
-
-	return 0;
-}
-
 static void ath12k_dp_update_vdev_search(struct ath12k_link_vif *arvif)
 {
 	switch (arvif->ahvif->vdev_type) {
@@ -1164,31 +1010,36 @@ static void ath12k_dp_cc_cleanup(struct ath12k_base *ab)
 	/* RX Descriptor cleanup */
 	spin_lock_bh(&dp->rx_desc_lock);
 
-	for (i = 0; i < ATH12K_NUM_RX_SPT_PAGES; i++) {
-		desc_info = dp->rxbaddr[i];
-
-		for (j = 0; j < ATH12K_MAX_SPT_ENTRIES; j++) {
-			if (!desc_info[j].in_use) {
-				list_del(&desc_info[j].list);
+	if (dp->rxbaddr) {
+		for (i = 0; i < ATH12K_NUM_RX_SPT_PAGES(ab); i++) {
+			if (!dp->rxbaddr[i])
 				continue;
+
+			desc_info = dp->rxbaddr[i];
+
+			for (j = 0; j < ATH12K_MAX_SPT_ENTRIES; j++) {
+				if (!desc_info[j].in_use) {
+					list_del(&desc_info[j].list);
+					continue;
+				}
+
+				skb = desc_info[j].skb;
+				if (!skb)
+					continue;
+
+				dma_unmap_single(ab->dev,
+						 ATH12K_SKB_RXCB(skb)->paddr,
+						 skb->len + skb_tailroom(skb),
+						 DMA_FROM_DEVICE);
+				dev_kfree_skb_any(skb);
 			}
 
-			skb = desc_info[j].skb;
-			if (!skb)
-				continue;
-
-			dma_unmap_single(ab->dev, ATH12K_SKB_RXCB(skb)->paddr,
-					 skb->len + skb_tailroom(skb), DMA_FROM_DEVICE);
-			dev_kfree_skb_any(skb);
+			kfree(dp->rxbaddr[i]);
+			dp->rxbaddr[i] = NULL;
 		}
-	}
 
-	for (i = 0; i < ATH12K_NUM_RX_SPT_PAGES; i++) {
-		if (!dp->rxbaddr[i])
-			continue;
-
-		kfree(dp->rxbaddr[i]);
-		dp->rxbaddr[i] = NULL;
+		kfree(dp->rxbaddr);
+		dp->rxbaddr = NULL;
 	}
 
 	spin_unlock_bh(&dp->rx_desc_lock);
@@ -1197,8 +1048,8 @@ static void ath12k_dp_cc_cleanup(struct ath12k_base *ab)
 	for (i = 0; i < ATH12K_HW_MAX_QUEUES; i++) {
 		spin_lock_bh(&dp->tx_desc_lock[i]);
 
-		list_for_each_entry_safe(tx_desc_info, tmp1, &dp->tx_desc_used_list[i],
-					 list) {
+		list_for_each_entry_safe(tx_desc_info, tmp1,
+					 &dp->tx_desc_used_list[i], list) {
 			list_del(&tx_desc_info->list);
 			skb = tx_desc_info->skb;
 
@@ -1232,19 +1083,25 @@ static void ath12k_dp_cc_cleanup(struct ath12k_base *ab)
 		spin_unlock_bh(&dp->tx_desc_lock[i]);
 	}
 
-	for (pool_id = 0; pool_id < ATH12K_HW_MAX_QUEUES; pool_id++) {
-		spin_lock_bh(&dp->tx_desc_lock[pool_id]);
+	if (dp->txbaddr) {
+		for (pool_id = 0; pool_id < ATH12K_HW_MAX_QUEUES; pool_id++) {
+			spin_lock_bh(&dp->tx_desc_lock[pool_id]);
 
-		for (i = 0; i < ATH12K_TX_SPT_PAGES_PER_POOL; i++) {
-			tx_spt_page = i + pool_id * ATH12K_TX_SPT_PAGES_PER_POOL;
-			if (!dp->txbaddr[tx_spt_page])
-				continue;
+			for (i = 0; i < ATH12K_TX_SPT_PAGES_PER_POOL(ab); i++) {
+				tx_spt_page = i + pool_id *
+					      ATH12K_TX_SPT_PAGES_PER_POOL(ab);
+				if (!dp->txbaddr[tx_spt_page])
+					continue;
 
-			kfree(dp->txbaddr[tx_spt_page]);
-			dp->txbaddr[tx_spt_page] = NULL;
+				kfree(dp->txbaddr[tx_spt_page]);
+				dp->txbaddr[tx_spt_page] = NULL;
+			}
+
+			spin_unlock_bh(&dp->tx_desc_lock[pool_id]);
 		}
 
-		spin_unlock_bh(&dp->tx_desc_lock[pool_id]);
+		kfree(dp->txbaddr);
+		dp->txbaddr = NULL;
 	}
 
 	/* unmap SPT pages */
@@ -1393,8 +1250,8 @@ struct ath12k_rx_desc_info *ath12k_dp_get_rx_desc(struct ath12k_base *ab,
 	ppt_idx = u32_get_bits(cookie, ATH12K_DP_CC_COOKIE_PPT);
 	spt_idx = u32_get_bits(cookie, ATH12K_DP_CC_COOKIE_SPT);
 
-	start_ppt_idx = dp->rx_ppt_base + ATH12K_RX_SPT_PAGE_OFFSET;
-	end_ppt_idx = start_ppt_idx + ATH12K_NUM_RX_SPT_PAGES;
+	start_ppt_idx = dp->rx_ppt_base + ATH12K_RX_SPT_PAGE_OFFSET(ab);
+	end_ppt_idx = start_ppt_idx + ATH12K_NUM_RX_SPT_PAGES(ab);
 
 	if (ppt_idx < start_ppt_idx ||
 	    ppt_idx >= end_ppt_idx ||
@@ -1418,7 +1275,7 @@ struct ath12k_tx_desc_info *ath12k_dp_get_tx_desc(struct ath12k_base *ab,
 
 	start_ppt_idx = ATH12K_TX_SPT_PAGE_OFFSET;
 	end_ppt_idx = start_ppt_idx +
-		      (ATH12K_TX_SPT_PAGES_PER_POOL * ATH12K_HW_MAX_QUEUES);
+		      (ATH12K_TX_SPT_PAGES_PER_POOL(ab) * ATH12K_HW_MAX_QUEUES);
 
 	if (ppt_idx < start_ppt_idx ||
 	    ppt_idx >= end_ppt_idx ||
@@ -1435,13 +1292,24 @@ static int ath12k_dp_cc_desc_init(struct ath12k_base *ab)
 	struct ath12k_dp *dp = &ab->dp;
 	struct ath12k_rx_desc_info *rx_descs, **rx_desc_addr;
 	struct ath12k_tx_desc_info *tx_descs, **tx_desc_addr;
+	u32 num_rx_spt_pages = ATH12K_NUM_RX_SPT_PAGES(ab);
 	u32 i, j, pool_id, tx_spt_page;
 	u32 ppt_idx, cookie_ppt_idx;
 
 	spin_lock_bh(&dp->rx_desc_lock);
 
-	/* First ATH12K_NUM_RX_SPT_PAGES of allocated SPT pages are used for RX */
-	for (i = 0; i < ATH12K_NUM_RX_SPT_PAGES; i++) {
+	dp->rxbaddr = kcalloc(num_rx_spt_pages,
+			      sizeof(struct ath12k_rx_desc_info *), GFP_ATOMIC);
+
+	if (!dp->rxbaddr) {
+		spin_unlock_bh(&dp->rx_desc_lock);
+		return -ENOMEM;
+	}
+
+	/* First ATH12K_NUM_RX_SPT_PAGES(ab) of allocated SPT pages are used for
+	 * RX
+	 */
+	for (i = 0; i < num_rx_spt_pages; i++) {
 		rx_descs = kcalloc(ATH12K_MAX_SPT_ENTRIES, sizeof(*rx_descs),
 				   GFP_ATOMIC);
 
@@ -1450,7 +1318,7 @@ static int ath12k_dp_cc_desc_init(struct ath12k_base *ab)
 			return -ENOMEM;
 		}
 
-		ppt_idx = ATH12K_RX_SPT_PAGE_OFFSET + i;
+		ppt_idx = ATH12K_RX_SPT_PAGE_OFFSET(ab) + i;
 		cookie_ppt_idx = dp->rx_ppt_base + ppt_idx;
 		dp->rxbaddr[i] = &rx_descs[0];
 
@@ -1468,9 +1336,15 @@ static int ath12k_dp_cc_desc_init(struct ath12k_base *ab)
 
 	spin_unlock_bh(&dp->rx_desc_lock);
 
+	dp->txbaddr = kcalloc(ATH12K_NUM_TX_SPT_PAGES(ab),
+			      sizeof(struct ath12k_tx_desc_info *), GFP_ATOMIC);
+
+	if (!dp->txbaddr)
+		return -ENOMEM;
+
 	for (pool_id = 0; pool_id < ATH12K_HW_MAX_QUEUES; pool_id++) {
 		spin_lock_bh(&dp->tx_desc_lock[pool_id]);
-		for (i = 0; i < ATH12K_TX_SPT_PAGES_PER_POOL; i++) {
+		for (i = 0; i < ATH12K_TX_SPT_PAGES_PER_POOL(ab); i++) {
 			tx_descs = kcalloc(ATH12K_MAX_SPT_ENTRIES, sizeof(*tx_descs),
 					   GFP_ATOMIC);
 
@@ -1480,7 +1354,8 @@ static int ath12k_dp_cc_desc_init(struct ath12k_base *ab)
 				return -ENOMEM;
 			}
 
-			tx_spt_page = i + pool_id * ATH12K_TX_SPT_PAGES_PER_POOL;
+			tx_spt_page = i + pool_id *
+				      ATH12K_TX_SPT_PAGES_PER_POOL(ab);
 			ppt_idx = ATH12K_TX_SPT_PAGE_OFFSET + tx_spt_page;
 
 			dp->txbaddr[tx_spt_page] = &tx_descs[0];
@@ -1514,12 +1389,12 @@ static int ath12k_dp_cmem_init(struct ath12k_base *ab,
 	switch (type) {
 	case ATH12K_DP_TX_DESC:
 		start = ATH12K_TX_SPT_PAGE_OFFSET;
-		end = start + ATH12K_NUM_TX_SPT_PAGES;
+		end = start + ATH12K_NUM_TX_SPT_PAGES(ab);
 		break;
 	case ATH12K_DP_RX_DESC:
 		cmem_base += ATH12K_PPT_ADDR_OFFSET(dp->rx_ppt_base);
-		start = ATH12K_RX_SPT_PAGE_OFFSET;
-		end = start + ATH12K_NUM_RX_SPT_PAGES;
+		start = ATH12K_RX_SPT_PAGE_OFFSET(ab);
+		end = start + ATH12K_NUM_RX_SPT_PAGES(ab);
 		break;
 	default:
 		ath12k_err(ab, "invalid descriptor type %d in cmem init\n", type);
@@ -1547,6 +1422,11 @@ void ath12k_dp_partner_cc_init(struct ath12k_base *ab)
 	}
 }
 
+static u32 ath12k_dp_get_num_spt_pages(struct ath12k_base *ab)
+{
+	return ATH12K_NUM_RX_SPT_PAGES(ab) + ATH12K_NUM_TX_SPT_PAGES(ab);
+}
+
 static int ath12k_dp_cc_init(struct ath12k_base *ab)
 {
 	struct ath12k_dp *dp = &ab->dp;
@@ -1561,7 +1441,7 @@ static int ath12k_dp_cc_init(struct ath12k_base *ab)
 		spin_lock_init(&dp->tx_desc_lock[i]);
 	}
 
-	dp->num_spt_pages = ATH12K_NUM_SPT_PAGES;
+	dp->num_spt_pages = ath12k_dp_get_num_spt_pages(ab);
 	if (dp->num_spt_pages > ATH12K_MAX_PPT_ENTRIES)
 		dp->num_spt_pages = ATH12K_MAX_PPT_ENTRIES;
 
@@ -1573,7 +1453,7 @@ static int ath12k_dp_cc_init(struct ath12k_base *ab)
 		return -ENOMEM;
 	}
 
-	dp->rx_ppt_base = ab->device_id * ATH12K_NUM_RX_SPT_PAGES;
+	dp->rx_ppt_base = ab->device_id * ATH12K_NUM_RX_SPT_PAGES(ab);
 
 	for (i = 0; i < dp->num_spt_pages; i++) {
 		dp->spt_info[i].vaddr = dma_alloc_coherent(ab->dev,
@@ -1748,7 +1628,8 @@ int ath12k_dp_alloc(struct ath12k_base *ab)
 	if (ret)
 		goto fail_dp_bank_profiles_cleanup;
 
-	size = sizeof(struct hal_wbm_release_ring_tx) * DP_TX_COMP_RING_SIZE;
+	size = sizeof(struct hal_wbm_release_ring_tx) *
+	       DP_TX_COMP_RING_SIZE(ab);
 
 	ret = ath12k_dp_reoq_lut_setup(ab);
 	if (ret) {
@@ -1760,7 +1641,7 @@ int ath12k_dp_alloc(struct ath12k_base *ab)
 		dp->tx_ring[i].tcl_data_ring_id = i;
 
 		dp->tx_ring[i].tx_status_head = 0;
-		dp->tx_ring[i].tx_status_tail = DP_TX_COMP_RING_SIZE - 1;
+		dp->tx_ring[i].tx_status_tail = DP_TX_COMP_RING_SIZE(ab) - 1;
 		dp->tx_ring[i].tx_status = kmalloc(size, GFP_KERNEL);
 		if (!dp->tx_ring[i].tx_status) {
 			ret = -ENOMEM;
