@@ -260,12 +260,12 @@ static const struct snd_kcontrol_new tas2770_snd_controls[] = {
 		0, 0, 20, 0, tas2781_amp_getvol,
 		tas2781_amp_putvol, tas2770_amp_tlv),
 	ACARD_SINGLE_RANGE_EXT_TLV("Speaker Digital Volume", TAS2770_DVC_LEVEL,
-		0, 0, 31, 0, tas2781_amp_getvol,
+		0, 0, 200, 1, tas2781_amp_getvol,
 		tas2781_amp_putvol, tas2770_dvc_tlv),
 };
 
 static const struct snd_kcontrol_new tas2781_snd_controls[] = {
-	ACARD_SINGLE_RANGE_EXT_TLV("Speaker Analog Gain", TAS2781_AMP_LEVEL,
+	ACARD_SINGLE_RANGE_EXT_TLV("Speaker Analog Volume", TAS2781_AMP_LEVEL,
 		1, 0, 20, 0, tas2781_amp_getvol,
 		tas2781_amp_putvol, amp_vol_tlv),
 	ACARD_SINGLE_BOOL_EXT("Speaker Force Firmware Load", 0,
