@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 /*
  * Copyright (c) 2019-2021 The Linux Foundation. All rights reserved.
- * Copyright (c) 2021-2025 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include "dp_mon.h"
 #include "debug.h"
-#include "dp_rx.h"
+#include "wifi7/hal_qcn9274.h"
+#include "wifi7/dp_rx.h"
 #include "dp_tx.h"
 #include "peer.h"
 
@@ -1812,7 +1813,7 @@ ath12k_dp_rx_mon_buf_done(struct ath12k_base *ab, struct hal_srng *srng,
 	if (!status_desc)
 		return DP_MON_STATUS_NO_DMA;
 
-	ath12k_hal_rx_buf_addr_info_get(status_desc, &paddr, &cookie, &rbm);
+	ath12k_wifi7_hal_rx_buf_addr_info_get(status_desc, &paddr, &cookie, &rbm);
 
 	buf_id = u32_get_bits(cookie, DP_RXDMA_BUF_COOKIE_BUF_ID);
 
@@ -1864,7 +1865,7 @@ void ath12k_dp_mon_next_link_desc_get(struct hal_rx_msdu_link *msdu_link,
 
 	buf_addr_info = &msdu_link->buf_addr_info;
 
-	ath12k_hal_rx_buf_addr_info_get(buf_addr_info, paddr, sw_cookie, rbm);
+	ath12k_wifi7_hal_rx_buf_addr_info_get(buf_addr_info, paddr, sw_cookie, rbm);
 
 	*pp_buf_addr_info = buf_addr_info;
 }
@@ -2045,7 +2046,7 @@ ath12k_dp_mon_rx_merg_msdus(struct ath12k *ar,
 
 		rx_desc = (struct hal_rx_desc *)head_msdu->data;
 		hdr_desc =
-			ab->hal_rx_ops->rx_desc_get_msdu_payload(rx_desc);
+			ab->hw_params->hal_ops->rx_desc_get_msdu_payload(rx_desc);
 
 		/* Base size */
 		wh = (struct ieee80211_hdr_3addr *)hdr_desc;
@@ -2146,10 +2147,15 @@ static void ath12k_dp_mon_update_radiotap(struct ath12k *ar,
 					  struct ieee80211_rx_status *rxs)
 {
 	struct ieee80211_supported_band *sband;
+	s32 noise_floor;
 	u8 *ptr = NULL;
 
+	spin_lock_bh(&ar->data_lock);
+	noise_floor = ath12k_pdev_get_noise_floor(ar);
+	spin_unlock_bh(&ar->data_lock);
+
 	rxs->flag |= RX_FLAG_MACTIME_START;
-	rxs->signal = ppduinfo->rssi_comb + ATH12K_DEFAULT_NOISE_FLOOR;
+	rxs->signal = ppduinfo->rssi_comb + noise_floor;
 	rxs->nss = ppduinfo->nss + 1;
 
 	if (ppduinfo->userstats[ppduinfo->userid].ampdu_present) {
@@ -2252,9 +2258,10 @@ static void ath12k_dp_mon_rx_deliver_msdu(struct ath12k *ar, struct napi_struct 
 	struct ieee80211_sta *pubsta = NULL;
 	struct ath12k_peer *peer;
 	struct ath12k_skb_rxcb *rxcb = ATH12K_SKB_RXCB(msdu);
-	struct ath12k_dp_rx_info rx_info;
+	struct hal_rx_desc_data rx_info;
 	bool is_mcbc = rxcb->is_mcbc;
 	bool is_eapol_tkip = rxcb->is_eapol;
+	struct hal_rx_desc *rx_desc = (struct hal_rx_desc *)msdu->data;
 
 	status->link_valid = 0;
 
@@ -2264,6 +2271,8 @@ static void ath12k_dp_mon_rx_deliver_msdu(struct ath12k *ar, struct napi_struct 
 		memcpy(he, &known, sizeof(known));
 		status->flag |= RX_FLAG_RADIOTAP_HE;
 	}
+
+	ath12k_wifi7_dp_extract_rx_desc_data(ar->ab, &rx_info, rx_desc, rx_desc);
 
 	spin_lock_bh(&ar->ab->base_lock);
 	rx_info.addr2_present = false;
@@ -2718,7 +2727,7 @@ int ath12k_dp_mon_status_bufs_replenish(struct ath12k_base *ab,
 
 		num_remain--;
 
-		ath12k_hal_rx_buf_addr_info_set(desc, paddr, cookie, mgr);
+		ath12k_wifi7_hal_rx_buf_addr_info_set(desc, paddr, cookie, mgr);
 	}
 
 	ath12k_hal_srng_access_end(ab, srng);
@@ -3610,7 +3619,6 @@ ath12k_dp_mon_rx_update_user_stats(struct ath12k *ar,
 				   struct hal_rx_mon_ppdu_info *ppdu_info,
 				   u32 uid)
 {
-	struct ath12k_sta *ahsta;
 	struct ath12k_link_sta *arsta;
 	struct ath12k_rx_peer_stats *rx_stats = NULL;
 	struct hal_rx_user_status *user_stats = &ppdu_info->userstats[uid];
@@ -3628,8 +3636,13 @@ ath12k_dp_mon_rx_update_user_stats(struct ath12k *ar,
 		return;
 	}
 
-	ahsta = ath12k_sta_to_ahsta(peer->sta);
-	arsta = &ahsta->deflink;
+	arsta = ath12k_peer_get_link_sta(ar->ab, peer);
+	if (!arsta) {
+		ath12k_warn(ar->ab, "link sta not found on peer %pM id %d\n",
+			    peer->addr, peer->peer_id);
+		return;
+	}
+
 	arsta->rssi_comb = ppdu_info->rssi_comb;
 	ewma_avg_rssi_add(&arsta->avg_rssi, ppdu_info->rssi_comb);
 	rx_stats = arsta->rx_stats;
@@ -3742,7 +3755,6 @@ int ath12k_dp_mon_srng_process(struct ath12k *ar, int *budget,
 	struct dp_srng *mon_dst_ring;
 	struct hal_srng *srng;
 	struct dp_rxdma_mon_ring *buf_ring;
-	struct ath12k_sta *ahsta = NULL;
 	struct ath12k_link_sta *arsta;
 	struct ath12k_peer *peer;
 	struct sk_buff_head skb_list;
@@ -3868,8 +3880,15 @@ move_next:
 		}
 
 		if (ppdu_info->reception_type == HAL_RX_RECEPTION_TYPE_SU) {
-			ahsta = ath12k_sta_to_ahsta(peer->sta);
-			arsta = &ahsta->deflink;
+			arsta = ath12k_peer_get_link_sta(ar->ab, peer);
+			if (!arsta) {
+				ath12k_warn(ar->ab, "link sta not found on peer %pM id %d\n",
+					    peer->addr, peer->peer_id);
+				spin_unlock_bh(&ab->base_lock);
+				rcu_read_unlock();
+				dev_kfree_skb_any(skb);
+				continue;
+			}
 			ath12k_dp_mon_rx_update_peer_su_stats(ar, arsta,
 							      ppdu_info);
 		} else if ((ppdu_info->fc_valid) &&
@@ -3927,8 +3946,8 @@ static int ath12k_dp_rx_reap_mon_status_ring(struct ath12k_base *ab, int mac_id,
 			pmon->buf_state = DP_MON_STATUS_REPLINISH;
 			break;
 		}
-		ath12k_hal_rx_buf_addr_info_get(rx_mon_status_desc, &paddr,
-						&cookie, &rbm);
+		ath12k_wifi7_hal_rx_buf_addr_info_get(rx_mon_status_desc, &paddr,
+						      &cookie, &rbm);
 		if (paddr) {
 			buf_id = u32_get_bits(cookie, DP_RXDMA_BUF_COOKIE_BUF_ID);
 
@@ -4009,12 +4028,12 @@ static int ath12k_dp_rx_reap_mon_status_ring(struct ath12k_base *ab, int mac_id,
 move_next:
 		skb = ath12k_dp_rx_alloc_mon_status_buf(ab, rx_ring,
 							&buf_id);
+		hal_params = ab->hw_params->hal_params;
 
 		if (!skb) {
 			ath12k_warn(ab, "failed to alloc buffer for status ring\n");
-			hal_params = ab->hw_params->hal_params;
-			ath12k_hal_rx_buf_addr_info_set(rx_mon_status_desc, 0, 0,
-							hal_params->rx_buf_rbm);
+			ath12k_wifi7_hal_rx_buf_addr_info_set(rx_mon_status_desc, 0, 0,
+							      hal_params->rx_buf_rbm);
 			num_buffs_reaped++;
 			break;
 		}
@@ -4023,9 +4042,9 @@ move_next:
 		cookie = u32_encode_bits(mac_id, DP_RXDMA_BUF_COOKIE_PDEV_ID) |
 			 u32_encode_bits(buf_id, DP_RXDMA_BUF_COOKIE_BUF_ID);
 
-		ath12k_hal_rx_buf_addr_info_set(rx_mon_status_desc, rxcb->paddr,
-						cookie,
-						ab->hw_params->hal_params->rx_buf_rbm);
+		ath12k_wifi7_hal_rx_buf_addr_info_set(rx_mon_status_desc, rxcb->paddr,
+						      cookie,
+						      hal_params->rx_buf_rbm);
 		ath12k_hal_srng_src_get_next_entry(ab, srng);
 		num_buffs_reaped++;
 	}
@@ -4194,14 +4213,14 @@ next_msdu:
 			list_add_tail(&desc_info->list, used_list);
 		}
 
-		ath12k_hal_rx_buf_addr_info_set(&buf_info, paddr, sw_cookie, rbm);
+		ath12k_wifi7_hal_rx_buf_addr_info_set(&buf_info, paddr, sw_cookie, rbm);
 
 		ath12k_dp_mon_next_link_desc_get(msdu_link_desc, &paddr,
 						 &sw_cookie, &rbm,
 						 &p_buf_addr_info);
 
-		ath12k_dp_rx_link_desc_return(ar->ab, &buf_info,
-					      HAL_WBM_REL_BM_ACT_PUT_IN_IDLE);
+		ath12k_wifi7_dp_rx_link_desc_return(ar->ab, &buf_info,
+						    HAL_WBM_REL_BM_ACT_PUT_IN_IDLE);
 
 		p_last_buf_addr_info = p_buf_addr_info;
 
