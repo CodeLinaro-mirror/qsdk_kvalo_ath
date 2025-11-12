@@ -371,11 +371,11 @@ static void b53_set_forwarding(struct b53_device *dev, int enable)
 		 * frames should be flooded or not.
 		 */
 		b53_read8(dev, B53_CTRL_PAGE, B53_IP_MULTICAST_CTRL, &mgmt);
-		mgmt |= B53_UC_FWD_EN | B53_MC_FWD_EN | B53_IPMC_FWD_EN;
+		mgmt |= B53_UC_FWD_EN | B53_MC_FWD_EN | B53_IP_MC;
 		b53_write8(dev, B53_CTRL_PAGE, B53_IP_MULTICAST_CTRL, mgmt);
 	} else {
 		b53_read8(dev, B53_CTRL_PAGE, B53_IP_MULTICAST_CTRL, &mgmt);
-		mgmt |= B53_IP_MCAST_25;
+		mgmt |= B53_IP_MC;
 		b53_write8(dev, B53_CTRL_PAGE, B53_IP_MULTICAST_CTRL, mgmt);
 	}
 }
@@ -632,6 +632,25 @@ static void b53_port_set_learning(struct b53_device *dev, int port,
 	b53_write16(dev, B53_CTRL_PAGE, B53_DIS_LEARNING, reg);
 }
 
+static void b53_port_set_isolated(struct b53_device *dev, int port,
+				  bool isolated)
+{
+	u8 offset;
+	u16 reg;
+
+	if (is5325(dev))
+		offset = B53_PROTECTED_PORT_SEL_25;
+	else
+		offset = B53_PROTECTED_PORT_SEL;
+
+	b53_read16(dev, B53_CTRL_PAGE, offset, &reg);
+	if (isolated)
+		reg |= BIT(port);
+	else
+		reg &= ~BIT(port);
+	b53_write16(dev, B53_CTRL_PAGE, offset, reg);
+}
+
 static void b53_eee_enable_set(struct dsa_switch *ds, int port, bool enable)
 {
 	struct b53_device *dev = ds->priv;
@@ -652,6 +671,7 @@ int b53_setup_port(struct dsa_switch *ds, int port)
 	b53_port_set_ucast_flood(dev, port, true);
 	b53_port_set_mcast_flood(dev, port, true);
 	b53_port_set_learning(dev, port, false);
+	b53_port_set_isolated(dev, port, false);
 
 	/* Force all traffic to go to the CPU port to prevent the ASIC from
 	 * trying to forward to bridged ports on matching FDB entries, then
@@ -688,6 +708,9 @@ int b53_enable_port(struct dsa_switch *ds, int port, struct phy_device *phy)
 		return 0;
 
 	cpu_port = dsa_to_port(ds, port)->cpu_dp->index;
+
+	if (dev->ops->phy_enable)
+		dev->ops->phy_enable(dev, port);
 
 	if (dev->ops->irq_enable)
 		ret = dev->ops->irq_enable(dev, port);
@@ -726,6 +749,9 @@ void b53_disable_port(struct dsa_switch *ds, int port)
 	b53_read8(dev, B53_CTRL_PAGE, B53_PORT_CTRL(port), &reg);
 	reg |= PORT_CTRL_RX_DISABLE | PORT_CTRL_TX_DISABLE;
 	b53_write8(dev, B53_CTRL_PAGE, B53_PORT_CTRL(port), reg);
+
+	if (dev->ops->phy_disable)
+		dev->ops->phy_disable(dev, port);
 
 	if (dev->ops->irq_disable)
 		dev->ops->irq_disable(dev, port);
@@ -1267,9 +1293,15 @@ static int b53_setup(struct dsa_switch *ds)
 	 */
 	ds->untag_vlan_aware_bridge_pvid = true;
 
-	/* Ageing time is set in seconds */
-	ds->ageing_time_min = 1 * 1000;
-	ds->ageing_time_max = AGE_TIME_MAX * 1000;
+	if (dev->chip_id == BCM53101_DEVICE_ID) {
+		/* BCM53101 uses 0.5 second increments */
+		ds->ageing_time_min = 1 * 500;
+		ds->ageing_time_max = AGE_TIME_MAX * 500;
+	} else {
+		/* Everything else uses 1 second increments */
+		ds->ageing_time_min = 1 * 1000;
+		ds->ageing_time_max = AGE_TIME_MAX * 1000;
+	}
 
 	ret = b53_reset_switch(dev);
 	if (ret) {
@@ -1360,6 +1392,10 @@ static void b53_force_port_config(struct b53_device *dev, int port,
 	else
 		reg &= ~PORT_OVERRIDE_FULL_DUPLEX;
 
+	reg &= ~(0x3 << GMII_PO_SPEED_S);
+	if (is5301x(dev) || is58xx(dev))
+		reg &= ~PORT_OVERRIDE_SPEED_2000M;
+
 	switch (speed) {
 	case 2000:
 		reg |= PORT_OVERRIDE_SPEED_2000M;
@@ -1377,6 +1413,11 @@ static void b53_force_port_config(struct b53_device *dev, int port,
 		dev_err(dev->dev, "unknown speed: %d\n", speed);
 		return;
 	}
+
+	if (is5325(dev))
+		reg &= ~PORT_OVERRIDE_LP_FLOW_25;
+	else
+		reg &= ~(PORT_OVERRIDE_RX_FLOW | PORT_OVERRIDE_TX_FLOW);
 
 	if (rx_pause) {
 		if (is5325(dev))
@@ -1404,7 +1445,7 @@ static void b53_adjust_63xx_rgmii(struct dsa_switch *ds, int port,
 	b53_read8(dev, B53_CTRL_PAGE, B53_RGMII_CTRL_P(port), &rgmii_ctrl);
 	rgmii_ctrl &= ~(RGMII_CTRL_DLL_RXC | RGMII_CTRL_DLL_TXC);
 
-	if (is63268(dev))
+	if (is6318_268(dev))
 		rgmii_ctrl |= RGMII_CTRL_MII_OVERRIDE;
 
 	rgmii_ctrl |= RGMII_CTRL_ENABLE_GMII;
@@ -1581,8 +1622,11 @@ static void b53_phylink_mac_link_down(struct phylink_config *config,
 	struct b53_device *dev = dp->ds->priv;
 	int port = dp->index;
 
-	if (mode == MLO_AN_PHY)
+	if (mode == MLO_AN_PHY) {
+		if (is63xx(dev) && in_range(port, B53_63XX_RGMII0, 4))
+			b53_force_link(dev, port, false);
 		return;
+	}
 
 	if (mode == MLO_AN_FIXED) {
 		b53_force_link(dev, port, false);
@@ -1610,6 +1654,13 @@ static void b53_phylink_mac_link_up(struct phylink_config *config,
 	if (mode == MLO_AN_PHY) {
 		/* Re-negotiate EEE if it was enabled already */
 		p->eee_enabled = b53_eee_init(ds, port, phydev);
+
+		if (is63xx(dev) && in_range(port, B53_63XX_RGMII0, 4)) {
+			b53_force_port_config(dev, port, speed, duplex,
+					      tx_pause, rx_pause);
+			b53_force_link(dev, port, true);
+		}
+
 		return;
 	}
 
@@ -2006,7 +2057,7 @@ static int b53_arl_search_wait(struct b53_device *dev)
 	do {
 		b53_read8(dev, B53_ARLIO_PAGE, offset, &reg);
 		if (!(reg & ARL_SRCH_STDN))
-			return 0;
+			return -ENOENT;
 
 		if (reg & ARL_SRCH_VLID)
 			return 0;
@@ -2056,12 +2107,15 @@ static int b53_fdb_copy(int port, const struct b53_arl_entry *ent,
 int b53_fdb_dump(struct dsa_switch *ds, int port,
 		 dsa_fdb_dump_cb_t *cb, void *data)
 {
+	unsigned int count = 0, results_per_hit = 1;
 	struct b53_device *priv = ds->priv;
 	struct b53_arl_entry results[2];
-	unsigned int count = 0;
 	u8 offset;
 	int ret;
 	u8 reg;
+
+	if (priv->num_arl_bins > 2)
+		results_per_hit = 2;
 
 	mutex_lock(&priv->arl_mutex);
 
@@ -2072,7 +2126,7 @@ int b53_fdb_dump(struct dsa_switch *ds, int port,
 
 	/* Start search operation */
 	reg = ARL_SRCH_STDN;
-	b53_write8(priv, offset, B53_ARL_SRCH_CTL, reg);
+	b53_write8(priv, B53_ARLIO_PAGE, offset, reg);
 
 	do {
 		ret = b53_arl_search_wait(priv);
@@ -2084,7 +2138,7 @@ int b53_fdb_dump(struct dsa_switch *ds, int port,
 		if (ret)
 			break;
 
-		if (priv->num_arl_bins > 2) {
+		if (results_per_hit == 2) {
 			b53_arl_search_rd(priv, 1, &results[1]);
 			ret = b53_fdb_copy(port, &results[1], cb, data);
 			if (ret)
@@ -2094,7 +2148,7 @@ int b53_fdb_dump(struct dsa_switch *ds, int port,
 				break;
 		}
 
-	} while (count++ < b53_max_arl_entries(priv) / 2);
+	} while (count++ < b53_max_arl_entries(priv) / results_per_hit);
 
 	mutex_unlock(&priv->arl_mutex);
 
@@ -2306,7 +2360,7 @@ int b53_br_flags_pre(struct dsa_switch *ds, int port,
 		     struct netlink_ext_ack *extack)
 {
 	struct b53_device *dev = ds->priv;
-	unsigned long mask = (BR_FLOOD | BR_MCAST_FLOOD);
+	unsigned long mask = (BR_FLOOD | BR_MCAST_FLOOD | BR_ISOLATED);
 
 	if (!is5325(dev))
 		mask |= BR_LEARNING;
@@ -2331,6 +2385,9 @@ int b53_br_flags(struct dsa_switch *ds, int port,
 	if (flags.mask & BR_LEARNING)
 		b53_port_set_learning(ds->priv, port,
 				      !!(flags.val & BR_LEARNING));
+	if (flags.mask & BR_ISOLATED)
+		b53_port_set_isolated(ds->priv, port,
+				      !!(flags.val & BR_ISOLATED));
 
 	return 0;
 }
@@ -2553,7 +2610,10 @@ int b53_set_ageing_time(struct dsa_switch *ds, unsigned int msecs)
 	else
 		reg = B53_AGING_TIME_CONTROL;
 
-	atc = DIV_ROUND_CLOSEST(msecs, 1000);
+	if (dev->chip_id == BCM53101_DEVICE_ID)
+		atc = DIV_ROUND_CLOSEST(msecs, 500);
+	else
+		atc = DIV_ROUND_CLOSEST(msecs, 1000);
 
 	if (!is5325(dev) && !is5365(dev))
 		atc |= AGE_CHANGE;
@@ -2769,19 +2829,6 @@ static const struct b53_chip_data b53_switch_chips[] = {
 		.jumbo_size_reg = B53_JUMBO_MAX_SIZE_63XX,
 	},
 	{
-		.chip_id = BCM63268_DEVICE_ID,
-		.dev_name = "BCM63268",
-		.vlans = 4096,
-		.enabled_ports = 0, /* pdata must provide them */
-		.arl_bins = 4,
-		.arl_buckets = 1024,
-		.imp_port = 8,
-		.vta_regs = B53_VTA_REGS_63XX,
-		.duplex_reg = B53_DUPLEX_STAT_63XX,
-		.jumbo_pm_reg = B53_JUMBO_PORT_MASK_63XX,
-		.jumbo_size_reg = B53_JUMBO_MAX_SIZE_63XX,
-	},
-	{
 		.chip_id = BCM53010_DEVICE_ID,
 		.dev_name = "BCM53010",
 		.vlans = 4096,
@@ -2930,13 +2977,17 @@ static const struct b53_chip_data b53_switch_chips[] = {
 
 static int b53_switch_init(struct b53_device *dev)
 {
+	u32 chip_id = dev->chip_id;
 	unsigned int i;
 	int ret;
+
+	if (is63xx(dev))
+		chip_id = BCM63XX_DEVICE_ID;
 
 	for (i = 0; i < ARRAY_SIZE(b53_switch_chips); i++) {
 		const struct b53_chip_data *chip = &b53_switch_chips[i];
 
-		if (chip->chip_id == dev->chip_id) {
+		if (chip->chip_id == chip_id) {
 			if (!dev->enabled_ports)
 				dev->enabled_ports = chip->enabled_ports;
 			dev->name = chip->dev_name;
