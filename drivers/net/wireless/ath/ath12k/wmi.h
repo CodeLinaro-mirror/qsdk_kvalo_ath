@@ -2015,7 +2015,7 @@ enum wmi_tlv_tag {
 	WMI_TAG_VDEV_CH_POWER_INFO,
 	WMI_TAG_MLO_LINK_SET_ACTIVE_CMD = 0x3BE,
 	WMI_TAG_EHT_RATE_SET = 0x3C4,
-	WMI_TAG_DCS_AWGN_INT_TYPE = 0x3C5,
+	WMI_TAG_DCS_INCUMBENT_SIGNAL_INTERFERENCE_TYPE = 0x3C5,
 	WMI_TAG_MLO_TX_SEND_PARAMS,
 	WMI_TAG_MLO_PARTNER_LINK_PARAMS,
 	WMI_TAG_MLO_PARTNER_LINK_PARAMS_PEER_ASSOC,
@@ -2269,6 +2269,8 @@ enum wmi_tlv_service {
 	WMI_TLV_SERVICE_EXT_TPC_REG_SUPPORT = 280,
 
 	WMI_TLV_SERVICE_REG_CC_EXT_EVENT_SUPPORT = 281,
+
+	WMI_TLV_SERVICE_DCS_INCUMBENT_SIGNAL_INTERFERENCE_SUPPORT = 286,
 
 	WMI_TLV_SERVICE_11BE = 289,
 
@@ -4245,11 +4247,21 @@ struct wmi_addba_clear_resp_cmd {
 #define DFS_UNIT_TEST_MODULE	0x2b
 #define DFS_UNIT_TEST_TOKEN	0xAA
 
+#define ATH12K_WMI_INCUMBENT_SIGNAL_UNIT_TEST_MODULE	0x18
+#define ATH12K_WMI_INCUMBENT_SIGNAL_UNIT_TEST_TOKEN	0
+#define ATH12K_WMI_UNIT_TEST_INCUMBENT_SIGNAL_INTF_TYPE	1
+
 enum dfs_test_args_idx {
 	DFS_TEST_CMDID = 0,
 	DFS_TEST_PDEV_ID,
 	DFS_TEST_RADAR_PARAM,
 	DFS_MAX_TEST_ARGS,
+};
+
+enum ath12k_wmi_incumbent_signal_test_args_idx {
+	ATH12K_WMI_INCUMBENT_SIGNAL_TEST_INTF,
+	ATH12K_WMI_INCUMBENT_SIGNAL_TEST_BITMAP,
+	ATH12K_WMI_INCUMBENT_SIGNAL_MAX_TEST_ARGS,
 };
 
 /* update if another test command requires more */
@@ -4535,6 +4547,62 @@ struct ath12k_wmi_pdev_radar_event {
 	a_sle32 freq_offset;
 	a_sle32 sidx;
 } __packed;
+
+#define ATH12K_WMI_DCS_INCUMBENT_SIGNAL_INTERFERENCE	0x04
+
+struct ath12k_wmi_dcs_interference_ev_fixed_params {
+	__le32 interference_type;
+	__le32 pdev_id;
+} __packed;
+
+struct ath12k_wmi_incumbent_signal_interference_params {
+	__le32 chan_width;
+	__le32 chan_freq;
+	__le32 center_freq0;
+	__le32 center_freq1;
+	__le32 chan_bw_interference_bitmap;
+} __packed;
+
+struct ath12k_wmi_incumbent_signal_interference_arg {
+	u32 chan_width;
+	u32 chan_freq;
+	u32 center_freq0;
+	u32 center_freq1;
+	u32 chan_bw_interference_bitmap;
+};
+
+struct ath12k_wmi_intf_arg {
+	u32 interference_type;
+	u32 pdev_id;
+};
+
+enum ath12k_wmi_dcs_interference_chan_segment {
+	/*
+	 * Firmware reports interference bitmap in primary-based order.
+	 * Bit 0 is the primary 20 MHz, bit 1 is the adjacent 20 MHz within
+	 * the primary 40 MHz. Bits 2-3 cover the secondary 40 MHz, bits 4-7
+	 * cover the secondary 80 MHz, and bits 8-15 cover the secondary 160 MHz.
+	 */
+	ATH12K_WMI_DCS_SEG_PRI20                 = 0x1,
+	ATH12K_WMI_DCS_SEG_SEC20                 = 0x2,
+	ATH12K_WMI_DCS_SEG_SEC40_LOW             = 0x4,
+	ATH12K_WMI_DCS_SEG_SEC40_UP              = 0x8,
+	ATH12K_WMI_DCS_SEG_SEC40                 = 0xC,
+	ATH12K_WMI_DCS_SEG_SEC80_LOW             = 0x10,
+	ATH12K_WMI_DCS_SEG_SEC80_LOW_UP          = 0x20,
+	ATH12K_WMI_DCS_SEG_SEC80_UP_LOW          = 0x40,
+	ATH12K_WMI_DCS_SEG_SEC80_UP              = 0x80,
+	ATH12K_WMI_DCS_SEG_SEC80                 = 0xF0,
+	ATH12K_WMI_DCS_SEG_SEC160_LOW            = 0x0100,
+	ATH12K_WMI_DCS_SEG_SEC160_LOW_UP         = 0x0200,
+	ATH12K_WMI_DCS_SEG_SEC160_LOW_UP_UP      = 0x0400,
+	ATH12K_WMI_DCS_SEG_SEC160_LOW_UP_UP_UP   = 0x0800,
+	ATH12K_WMI_DCS_SEG_SEC160_UP_LOW_LOW_LOW = 0x1000,
+	ATH12K_WMI_DCS_SEG_SEC160_UP_LOW_LOW     = 0x2000,
+	ATH12K_WMI_DCS_SEG_SEC160_UP_LOW         = 0x4000,
+	ATH12K_WMI_DCS_SEG_SEC160_UP             = 0x8000,
+	ATH12K_WMI_DCS_SEG_SEC160                = 0xFF00,
+};
 
 struct wmi_pdev_temperature_event {
 	/* temperature value in Celsius degree */
@@ -6627,6 +6695,8 @@ int ath12k_wmi_send_vdev_set_tpc_power(struct ath12k *ar,
 				       struct ath12k_reg_tpc_power_info *param);
 int ath12k_wmi_send_mlo_link_set_active_cmd(struct ath12k_base *ab,
 					    struct wmi_mlo_link_set_active_arg *param);
+int ath12k_wmi_simulate_incumbent_signal_interference(struct ath12k *ar,
+						      u32 chan_bw_interference_bitmap);
 int ath12k_wmi_alloc(void);
 void ath12k_wmi_free(void);
 
